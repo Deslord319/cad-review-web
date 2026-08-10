@@ -301,7 +301,7 @@ export default function Home() {
         <div className="brand-block">
           <span className="brand-mark">SC</span>
           <div>
-            <strong>Spark CAD Review</strong>
+            <strong>CAD Review Web</strong>
             <span>局域网成品审视器</span>
           </div>
         </div>
@@ -346,7 +346,7 @@ export default function Home() {
             ))}
           </div>
           <div className="model-list">
-            {loading && <p className="empty-message">正在读取 Spark 输出目录…</p>}
+            {loading && <p className="empty-message">正在读取模型目录…</p>}
             {!loading && viewableModels.length === 0 && (
               <p className="empty-message">
                 {scope === "active" ? "尚未发现可审视的 STL。" : scope === "archive" ? "归档区为空。" : "回收站为空。"}

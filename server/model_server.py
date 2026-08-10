@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local model index and file server for Spark CAD Review."""
+"""Local model index and file server for CAD Review Web."""
 
 from __future__ import annotations
 
@@ -189,7 +189,7 @@ def move_model(action: str, source_scope: str, name: str) -> dict:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SparkCADReview/1.1"
+    server_version = "CADReviewWeb/1.1"
 
     def end_headers(self):
         self.send_header("Access-Control-Allow-Origin", ALLOWED_ORIGIN)

@@ -1,4 +1,4 @@
-# Spark CAD Review
+# CAD Review Web
 
 A small, LAN-first Web interface for reviewing and organizing CAD exports. It renders STL files in the browser with Three.js and exposes model dimensions, facet count, volume, and a basic watertight check.
 
@@ -76,3 +76,7 @@ npm run check
 This project is designed for localhost or a trusted LAN. The file-management API has no authentication and allows archive/trash/restore operations inside `CAD_OUTPUT_DIR`. Do not expose the API directly to the public internet. Use a firewall, VPN, or an authenticated reverse proxy when access crosses a trusted network boundary.
 
 No CAD model files, screenshots, machine addresses, credentials, or printing data are included in this repository.
+
+## License
+
+Released under the [MIT License](LICENSE).
