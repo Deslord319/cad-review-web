@@ -1,3 +1,4 @@
+import os
 import sys
 import tempfile
 import types
@@ -10,7 +11,12 @@ from pathlib import Path
 SERVER_DIR = Path(__file__).parents[1] / "server"
 sys.path.insert(0, str(SERVER_DIR))
 
-from preview_convert import convert_3mf, load_3mf_scene, simplification_target
+from preview_convert import (
+    _allocate_face_targets,
+    convert_3mf,
+    load_3mf_scene,
+    simplification_target,
+)
 from preview_store import PreviewStore, preview_revision, storage_dirs_from_output
 
 
@@ -107,11 +113,11 @@ class PreviewStoreTests(unittest.TestCase):
         source = self.storage["archive"] / "upgrade.3mf"
         source.write_bytes(b"PK\x03\x04pipeline-upgrade")
         old_store = PreviewStore(
-            self.root / "preview-upgrade", pipeline_version="three-mf-glb-v2"
+            self.root / "preview-upgrade", pipeline_version="three-mf-glb-v3"
         )
         old = old_store.ensure_source("archive", source.name, source)
         new_store = PreviewStore(
-            self.root / "preview-upgrade", pipeline_version="three-mf-glb-v3"
+            self.root / "preview-upgrade", pipeline_version="three-mf-glb-v4"
         )
         before_reconcile = new_store.status_for_source(
             "archive", source.name, source, enqueue_missing=False
@@ -125,6 +131,151 @@ class PreviewStoreTests(unittest.TestCase):
 
 
 class PreviewConverterTests(unittest.TestCase):
+    def test_face_allocation_is_deterministic_and_strict(self):
+        targets = _allocate_face_targets([10, 30, 60], 17)
+        self.assertEqual(sum(targets), 17)
+        self.assertEqual(targets, _allocate_face_targets([10, 30, 60], 17))
+        self.assertTrue(all(0 < target <= count for target, count in zip(targets, [10, 30, 60])))
+
+    def test_large_packaged_part_streams_to_budget_and_cleans_memmap(self):
+        core = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
+        production = "http://schemas.microsoft.com/3dmanufacturing/production/2015/06"
+        vertices = []
+        triangles = []
+        for index in range(10):
+            base = index * 3
+            vertices.extend(
+                (
+                    f'<vertex x="{index}" y="0" z="0"/>',
+                    f'<vertex x="{index}" y="1" z="0"/>',
+                    f'<vertex x="{index}" y="0" z="1"/>',
+                )
+            )
+            triangles.append(
+                f'<triangle v1="{base}" v2="{base + 1}" v3="{base + 2}"/>'
+            )
+        external = f"""<?xml version="1.0" encoding="UTF-8"?>
+        <model unit="millimeter" xmlns="{core}"><resources>
+          <object id="1" name="sampled" type="model"><mesh>
+            <vertices>{''.join(vertices)}</vertices>
+            <triangles>{''.join(triangles)}</triangles>
+          </mesh></object>
+        </resources></model>"""
+        root_model = f"""<?xml version="1.0" encoding="UTF-8"?>
+        <model unit="millimeter" xmlns="{core}" xmlns:p="{production}" requiredextensions="p">
+          <resources><object id="10" type="model"><components>
+            <component p:path="/3D/Objects/large.model" objectid="1"/>
+          </components></object></resources>
+          <build>
+            <item objectid="10"/>
+            <item objectid="10" transform="1 0 0 0 1 0 0 0 1 20 0 0"/>
+          </build>
+        </model>"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "large-split.3mf"
+            work = root / "stream-work"
+            work.mkdir()
+            with zipfile.ZipFile(source, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("3D/3dmodel.model", root_model)
+                archive.writestr("3D/Objects/large.model", external)
+            scene, stats = load_3mf_scene(
+                source,
+                face_budget=4,
+                large_part_threshold=1,
+                temporary_root=work,
+            )
+            self.assertEqual(list(work.iterdir()), [])
+
+        self.assertEqual(stats["loader"], "packaged-3mf-stream")
+        self.assertTrue(stats["stream_sampled"])
+        self.assertEqual(stats["source_unique_faces"], 10)
+        self.assertEqual(stats["unique_faces"], 4)
+        self.assertEqual(stats["instances"], 2)
+        self.assertEqual(stats["instanced_faces"], 8)
+        self.assertEqual(len(scene.geometry), 1)
+        translations = sorted(
+            scene.graph.get(node)[0][0, 3] for node in scene.graph.nodes_geometry
+        )
+        self.assertEqual(translations, [0.0, 20.0])
+
+    def test_single_model_part_over_threshold_uses_stream_loader(self):
+        core = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
+        model = f"""<?xml version="1.0" encoding="UTF-8"?>
+        <model unit="millimeter" xmlns="{core}"><resources>
+          <object id="1" type="model"><mesh><vertices>
+            <vertex x="0" y="0" z="0"/><vertex x="1" y="0" z="0"/>
+            <vertex x="0" y="1" z="0"/><vertex x="0" y="0" z="1"/>
+          </vertices><triangles>
+            <triangle v1="0" v2="1" v3="2"/><triangle v1="0" v2="1" v3="3"/>
+            <triangle v1="0" v2="2" v3="3"/><triangle v1="1" v2="2" v3="3"/>
+          </triangles></mesh></object>
+        </resources><build><item objectid="1"/></build></model>"""
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "single-large.3mf"
+            with zipfile.ZipFile(source, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("3D/3dmodel.model", model)
+            scene, stats = load_3mf_scene(
+                source,
+                face_budget=2,
+                large_part_threshold=1,
+            )
+
+        self.assertEqual(stats["loader"], "packaged-3mf-stream")
+        self.assertEqual(stats["source_unique_faces"], 4)
+        self.assertEqual(stats["unique_faces"], 2)
+        self.assertEqual(len(scene.geometry), 1)
+
+    def test_multiple_streamed_parts_obey_global_preview_budget(self):
+        core = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
+        production = "http://schemas.microsoft.com/3dmanufacturing/production/2015/06"
+
+        def model_part(offset):
+            vertices = []
+            triangles = []
+            for index in range(10):
+                base = index * 3
+                vertices.extend(
+                    (
+                        f'<vertex x="{offset + index}" y="0" z="0"/>',
+                        f'<vertex x="{offset + index}" y="1" z="0"/>',
+                        f'<vertex x="{offset + index}" y="0" z="1"/>',
+                    )
+                )
+                triangles.append(
+                    f'<triangle v1="{base}" v2="{base + 1}" v3="{base + 2}"/>'
+                )
+            return f"""<model unit="millimeter" xmlns="{core}"><resources>
+              <object id="1" type="model"><mesh><vertices>{''.join(vertices)}</vertices>
+              <triangles>{''.join(triangles)}</triangles></mesh></object>
+              </resources></model>"""
+
+        root_model = f"""<model unit="millimeter" xmlns="{core}" xmlns:p="{production}">
+          <resources><object id="10" type="model"><components>
+            <component p:path="/3D/Objects/a.model" objectid="1"/>
+            <component p:path="/3D/Objects/b.model" objectid="1"/>
+          </components></object></resources><build><item objectid="10"/></build></model>"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "two-large.3mf"
+            output = root / "two-large.glb"
+            with zipfile.ZipFile(source, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("3D/3dmodel.model", root_model)
+                archive.writestr("3D/Objects/a.model", model_part(0))
+                archive.writestr("3D/Objects/b.model", model_part(100))
+            with mock.patch.dict(
+                os.environ,
+                {"CAD_VIEWER_3MF_STREAM_THRESHOLD_BYTES": "1"},
+            ):
+                result = convert_3mf(source, output, 6, "fast")
+
+        self.assertEqual(result["source_faces"], 20)
+        self.assertEqual(result["loaded_faces"], 12)
+        self.assertEqual(result["preview_faces"], 6)
+        self.assertLessEqual(result["preview_faces"], 6)
+        self.assertGreater(result["output_bytes"], 20)
+
     def test_split_3mf_loads_each_external_mesh_once_and_reuses_instances(self):
         core = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
         production = "http://schemas.microsoft.com/3dmanufacturing/production/2015/06"

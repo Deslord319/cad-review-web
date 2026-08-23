@@ -18,7 +18,7 @@ from typing import Iterable, Mapping
 
 PREVIEW_STATUSES = ("not_applicable", "pending", "processing", "ready", "failed")
 JOB_STATUSES = ("pending", "processing", "ready", "failed")
-DEFAULT_PIPELINE_VERSION = "three-mf-glb-v3"
+DEFAULT_PIPELINE_VERSION = "three-mf-glb-v4"
 DEFAULT_PROFILE = "fast"
 DEFAULT_FACE_BUDGET = 100_000
 

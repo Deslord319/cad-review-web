@@ -10,6 +10,8 @@ The bundled Python API indexes a configurable model directory and supports three
 - Persistent SQLite/WAL preview queue with content-addressed GLB artifacts
 - Independent, serial preview worker so model conversion never blocks the API
 - Split/production-extension 3MF loading by package path and object ID, with shared geometry instances instead of repeated mesh expansion
+- Two-pass streaming previews for large model XML parts, with temporary vertex memmaps, deterministic sampling, and a global face cap
+- Adaptive camera depth and sparse-preview point overlays keep large, widely spaced model sets visible in the WebGL viewer
 - STL audit data: dimensions, facets, volume, and watertight status
 - Download support for STL, 3MF, STEP/STP, FCStd, and PNG files
 - Archive, trash, and restore workflows implemented as local file moves
@@ -96,13 +98,15 @@ The Web interface uses port `8091` on the same hostname by default. To point it 
 | `CAD_VIEWER_ALLOWED_ORIGIN` | `http://localhost:5173` | Web origin allowed to call the API |
 | `CAD_VIEWER_PREVIEW_DIR` | `<CAD_OUTPUT_DIR>/.preview-cache` | SQLite/WAL queue and content-addressed GLB directory |
 | `CAD_VIEWER_PREVIEW_CACHE_DIR` | `<CAD_OUTPUT_DIR>/.preview-cache` | Backward-compatible alias for `CAD_VIEWER_PREVIEW_DIR` |
-| `CAD_VIEWER_PREVIEW_PIPELINE_VERSION` | `three-mf-glb-v3` | Converter version included in each cache key |
+| `CAD_VIEWER_PREVIEW_PIPELINE_VERSION` | `three-mf-glb-v4` | Converter version included in each cache key |
 | `CAD_VIEWER_PREVIEW_PROFILE` | `fast` | Preview conversion profile included in each cache key |
 | `CAD_VIEWER_PREVIEW_FACE_BUDGET` | `100000` | Fast-preview triangle budget |
 | `CAD_VIEWER_PREVIEW_TIMEOUT` | `300` | Per-model converter timeout in seconds |
 | `CAD_VIEWER_PREVIEW_MAX_ATTEMPTS` | `3` | Automatic attempts before a job becomes `failed` |
 | `CAD_VIEWER_PREVIEW_SCAN_INTERVAL` | `30` | External-file reconciliation interval in seconds |
 | `CAD_VIEWER_PREVIEW_NUMERIC_THREADS` | `1` | BLAS/OpenMP threads allowed in a converter subprocess |
+| `CAD_VIEWER_3MF_STREAM_THRESHOLD_BYTES` | `67108864` | Uncompressed model-part size that activates two-pass streaming |
+| `CAD_VIEWER_PREVIEW_TEMP_DIR` | System temporary directory | Optional location for streaming vertex memmaps |
 | `VITE_API_BASE_URL` | Same Web hostname, port `8091` | Browser-visible API URL |
 
 ## Preview API

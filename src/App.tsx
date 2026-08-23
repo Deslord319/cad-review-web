@@ -43,6 +43,13 @@ type ViewerState = {
   radius: number;
 };
 
+type ViewDepth = {
+  near: number;
+  far: number;
+  fogNear: number;
+  fogFar: number;
+};
+
 const EMPTY_PREVIEW_COUNTS: PreviewCounts = {
   not_applicable: 0,
   pending: 0,
@@ -58,6 +65,10 @@ const PREVIEW_STATUSES = new Set<PreviewStatus>([
   "ready",
   "failed",
 ]);
+
+const SPARSE_POINT_FACE_RATIO = 1.5;
+const SPARSE_POINT_MIN_FACES = 5_000;
+const SPARSE_POINT_SIZE = 2;
 
 function normalizeModel(model: ModelInfo): ModelInfo {
   const status = PREVIEW_STATUSES.has(model.preview_status)
@@ -94,12 +105,59 @@ function resolveApiUrl(value: string, apiBase: string) {
 }
 
 function disposeModel(model: THREE.Object3D) {
+  const geometries = new Set<THREE.BufferGeometry>();
+  const materials = new Set<THREE.Material>();
   model.traverse((child) => {
-    if (!(child instanceof THREE.Mesh)) return;
-    child.geometry.dispose();
-    const materials = Array.isArray(child.material) ? child.material : [child.material];
-    materials.forEach((material) => material.dispose());
+    const renderable = child as THREE.Object3D & {
+      geometry?: THREE.BufferGeometry;
+      material?: THREE.Material | THREE.Material[];
+    };
+    if (renderable.geometry instanceof THREE.BufferGeometry) {
+      geometries.add(renderable.geometry);
+    }
+    if (renderable.material) {
+      const childMaterials = Array.isArray(renderable.material)
+        ? renderable.material
+        : [renderable.material];
+      childMaterials.forEach((material) => materials.add(material));
+    }
   });
+  materials.forEach((material) => material.dispose());
+  geometries.forEach((geometry) => geometry.dispose());
+}
+
+function addSparsePreviewPointOverlays(model: THREE.Object3D) {
+  const meshes: THREE.Mesh[] = [];
+  model.traverse((child) => {
+    if (child instanceof THREE.Mesh) meshes.push(child);
+  });
+
+  let material: THREE.PointsMaterial | null = null;
+  let overlays = 0;
+  let vertices = 0;
+  meshes.forEach((mesh) => {
+    const position = mesh.geometry.getAttribute("position");
+    const faceCount = Math.floor(
+      (mesh.geometry.index?.count ?? position?.count ?? 0) / 3,
+    );
+    if (!position || faceCount < SPARSE_POINT_MIN_FACES) return;
+    if (position.count / faceCount <= SPARSE_POINT_FACE_RATIO) return;
+
+    material ??= new THREE.PointsMaterial({
+      color: 0xb9d6ff,
+      size: SPARSE_POINT_SIZE,
+      sizeAttenuation: false,
+      fog: false,
+    });
+    const points = new THREE.Points(mesh.geometry, material);
+    points.name = `${mesh.name || "mesh"}__cad_preview_points`;
+    points.userData.cadPreviewPointOverlay = true;
+    points.frustumCulled = mesh.frustumCulled;
+    mesh.add(points);
+    overlays += 1;
+    vertices += position.count;
+  });
+  return { overlays, vertices };
 }
 
 function setModelWireframe(model: THREE.Object3D, wireframe: boolean) {
@@ -113,6 +171,45 @@ function setModelWireframe(model: THREE.Object3D, wireframe: boolean) {
       }
     });
   });
+}
+
+// Keep the complete bounding sphere inside the frustum while retaining a
+// compact far/near ratio. A fixed far plane breaks as soon as a large model's
+// fitted camera is more than that distance from the origin.
+function calculateViewDepth(radius: number, cameraDistance: number): ViewDepth {
+  const safeRadius = Number.isFinite(radius) ? Math.max(radius, 1) : 1;
+  const safeDistance = Number.isFinite(cameraDistance)
+    ? Math.max(cameraDistance, safeRadius)
+    : safeRadius;
+  const near = Math.max(0.01, safeDistance - safeRadius * 1.5);
+  const far = Math.max(near + safeRadius * 3, safeDistance + safeRadius * 1.5);
+  return {
+    near,
+    far,
+    fogNear: safeDistance + safeRadius * 1.5,
+    fogFar: safeDistance + safeRadius * 6,
+  };
+}
+
+function updateViewDepth(state: ViewerState) {
+  if (!state.model) return;
+  const cameraDistance = state.camera.position.length();
+  const depth = calculateViewDepth(state.radius, cameraDistance);
+  const cameraChanged = Math.abs(state.camera.near - depth.near) > 0.001
+    || Math.abs(state.camera.far - depth.far) > 0.001;
+  if (cameraChanged) {
+    state.camera.near = depth.near;
+    state.camera.far = depth.far;
+    state.camera.updateProjectionMatrix();
+    state.renderer.domElement.dataset.cameraNear = depth.near.toFixed(3);
+    state.renderer.domElement.dataset.cameraFar = depth.far.toFixed(3);
+    state.renderer.domElement.dataset.cameraDistance = cameraDistance.toFixed(3);
+    state.renderer.domElement.dataset.modelRadius = state.radius.toFixed(3);
+  }
+  if (state.scene.fog instanceof THREE.Fog) {
+    state.scene.fog.near = depth.fogNear;
+    state.scene.fog.far = depth.fogFar;
+  }
 }
 
 function formatBytes(bytes: number) {
@@ -379,6 +476,7 @@ export default function Home() {
     const render = () => {
       state.frame = requestAnimationFrame(render);
       controls.update();
+      updateViewDepth(state);
       renderer.render(scene, camera);
     };
     render();
@@ -411,6 +509,7 @@ export default function Home() {
     state.camera.up.set(0, 1, 0);
     state.controls.target.set(0, 0, 0);
     state.controls.update();
+    updateViewDepth(state);
   }, []);
 
   useEffect(() => {
@@ -431,6 +530,8 @@ export default function Home() {
       state.model = null;
       state.modelKey = "";
     }
+    state.renderer.domElement.dataset.previewPointOverlays = "0";
+    state.renderer.domElement.dataset.previewPointVertices = "0";
 
     if (!selectedItemKey || !selectedViewable || !apiBase) {
       return () => {
@@ -472,6 +573,13 @@ export default function Home() {
         disposeModel(model);
         return;
       }
+      window.cancelAnimationFrame(clearFrame);
+      window.cancelAnimationFrame(loadingFrame);
+      const pointOverlay = selectedExtension === "3mf"
+        ? addSparsePreviewPointOverlays(model)
+        : { overlays: 0, vertices: 0 };
+      state.renderer.domElement.dataset.previewPointOverlays = String(pointOverlay.overlays);
+      state.renderer.domElement.dataset.previewPointVertices = String(pointOverlay.vertices);
       model.updateMatrixWorld(true);
       const box = new THREE.Box3().setFromObject(model);
       if (!box.isEmpty()) {
@@ -524,6 +632,8 @@ export default function Home() {
         })));
       } catch (loadError) {
         if (!isCurrent()) return;
+        window.cancelAnimationFrame(clearFrame);
+        window.cancelAnimationFrame(loadingFrame);
         setModelError(loadError instanceof Error
           ? `模型加载失败：${loadError.message}`
           : "模型加载失败，预览格式可能不受支持。");
