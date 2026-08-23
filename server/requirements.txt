@@ -1,0 +1,5 @@
+fast_simplification==0.2.0
+lxml==6.1.2
+networkx==3.6.1
+numpy==2.5.2
+trimesh==4.12.2

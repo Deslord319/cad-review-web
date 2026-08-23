@@ -3,7 +3,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
+
+type PreviewStatus = "not_applicable" | "pending" | "processing" | "ready" | "failed";
+type PreviewCounts = Record<PreviewStatus, number>;
 
 type ModelInfo = {
   name: string;
@@ -16,6 +20,10 @@ type ModelInfo = {
   volume?: number;
   watertight?: boolean;
   scope: ModelScope;
+  preview_status: PreviewStatus;
+  preview_url?: string;
+  preview_revision?: string;
+  preview_error?: string;
 };
 
 type ModelScope = "active" | "archive" | "trash";
@@ -29,10 +37,83 @@ type ViewerState = {
   camera: THREE.PerspectiveCamera;
   renderer: THREE.WebGLRenderer;
   controls: OrbitControls;
-  model: THREE.Mesh | null;
+  model: THREE.Object3D | null;
+  modelKey: string;
   frame: number;
   radius: number;
 };
+
+const EMPTY_PREVIEW_COUNTS: PreviewCounts = {
+  not_applicable: 0,
+  pending: 0,
+  processing: 0,
+  ready: 0,
+  failed: 0,
+};
+
+const PREVIEW_STATUSES = new Set<PreviewStatus>([
+  "not_applicable",
+  "pending",
+  "processing",
+  "ready",
+  "failed",
+]);
+
+function normalizeModel(model: ModelInfo): ModelInfo {
+  const status = PREVIEW_STATUSES.has(model.preview_status)
+    ? model.preview_status
+    : model.extension.toLowerCase() === "3mf"
+      ? "pending"
+      : "not_applicable";
+  return { ...model, preview_status: status };
+}
+
+function countPreviewStates(models: ModelInfo[]): PreviewCounts {
+  return models.reduce<PreviewCounts>((result, model) => {
+    result[model.preview_status] += 1;
+    return result;
+  }, { ...EMPTY_PREVIEW_COUNTS });
+}
+
+function previewStatusLabel(status: PreviewStatus) {
+  return {
+    not_applicable: "无需预览",
+    pending: "等待生成",
+    processing: "生成中",
+    ready: "已就绪",
+    failed: "生成失败",
+  }[status];
+}
+
+function resolveApiUrl(value: string, apiBase: string) {
+  try {
+    return new URL(value, `${apiBase.replace(/\/$/, "")}/`).toString();
+  } catch {
+    return "";
+  }
+}
+
+function disposeModel(model: THREE.Object3D) {
+  model.traverse((child) => {
+    if (!(child instanceof THREE.Mesh)) return;
+    child.geometry.dispose();
+    const materials = Array.isArray(child.material) ? child.material : [child.material];
+    materials.forEach((material) => material.dispose());
+  });
+}
+
+function setModelWireframe(model: THREE.Object3D, wireframe: boolean) {
+  model.traverse((child) => {
+    if (!(child instanceof THREE.Mesh)) return;
+    const materials = Array.isArray(child.material) ? child.material : [child.material];
+    materials.forEach((material) => {
+      if ("wireframe" in material) {
+        (material as THREE.MeshBasicMaterial).wireframe = wireframe;
+        material.needsUpdate = true;
+      }
+    });
+  });
+}
 
 function formatBytes(bytes: number) {
   if (bytes < 1024) return `${bytes} B`;
@@ -52,24 +133,42 @@ function formatDate(value: string) {
 export default function Home() {
   const canvasHost = useRef<HTMLDivElement>(null);
   const viewer = useRef<ViewerState | null>(null);
+  const loadGeneration = useRef(0);
+  const wireframeRef = useRef(false);
   const [apiBase, setApiBase] = useState("");
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [scope, setScope] = useState<ModelScope>("active");
   const [counts, setCounts] = useState<ModelCounts>({ active: 0, archive: 0, trash: 0 });
+  const [previewCounts, setPreviewCounts] = useState<PreviewCounts>(EMPTY_PREVIEW_COUNTS);
   const [selectedName, setSelectedName] = useState("");
   const [loading, setLoading] = useState(true);
   const [modelLoading, setModelLoading] = useState(false);
-  const [error, setError] = useState("");
+  const [loadedModelKey, setLoadedModelKey] = useState("");
+  const [serviceError, setServiceError] = useState("");
+  const [modelError, setModelError] = useState("");
   const [wireframe, setWireframe] = useState(false);
   const [autoRotate, setAutoRotate] = useState(false);
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
   const [actionLoading, setActionLoading] = useState(false);
   const [actionMessage, setActionMessage] = useState("");
+  const [previewRetrying, setPreviewRetrying] = useState(false);
+  const [urlReady, setUrlReady] = useState(false);
 
   const selected = useMemo(
     () => models.find((model) => model.name === selectedName) ?? null,
     [models, selectedName],
   );
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      const parameters = new URLSearchParams(window.location.search);
+      const requestedScope = parameters.get("scope");
+      if (requestedScope === "archive" || requestedScope === "trash") setScope(requestedScope);
+      setSelectedName(parameters.get("file") || "");
+      setUrlReady(true);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
 
   const refreshModels = useCallback(async (base?: string) => {
     const origin = base || apiBase;
@@ -77,23 +176,32 @@ export default function Home() {
     try {
       const response = await fetch(`${origin}/api/models?scope=${scope}`, { cache: "no-store" });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const data = (await response.json()) as { models: ModelInfo[]; counts: ModelCounts };
-      setModels(data.models);
+      const data = (await response.json()) as {
+        models: ModelInfo[];
+        counts: ModelCounts;
+        preview_counts?: Partial<PreviewCounts>;
+      };
+      const nextModels = data.models.map(normalizeModel);
+      setModels(nextModels);
       setCounts(data.counts);
+      setPreviewCounts(data.preview_counts
+        ? { ...EMPTY_PREVIEW_COUNTS, ...data.preview_counts }
+        : countPreviewStates(nextModels));
       setSelectedName((current) => {
-        if (current && data.models.some((item) => item.name === current)) return current;
-        return data.models.find((item) => item.viewable)?.name ?? data.models[0]?.name ?? "";
+        if (current && nextModels.some((item) => item.name === current)) return current;
+        return nextModels.find((item) => item.viewable)?.name ?? nextModels[0]?.name ?? "";
       });
       setUpdatedAt(new Date());
-      setError("");
+      setServiceError("");
     } catch {
-      setError("无法连接模型服务，请检查后台服务状态。");
+      setServiceError("无法连接模型服务，请检查后台服务状态。");
     } finally {
       setLoading(false);
     }
   }, [apiBase, scope]);
 
   useEffect(() => {
+    if (!urlReady) return;
     const configuredBase = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, "");
     const base = configuredBase || `${window.location.protocol}//${window.location.hostname}:8091`;
     const frame = window.requestAnimationFrame(() => {
@@ -105,12 +213,57 @@ export default function Home() {
       window.cancelAnimationFrame(frame);
       window.clearInterval(timer);
     };
-  }, [refreshModels]);
+  }, [refreshModels, urlReady]);
 
   const modelUrl = useCallback((model: ModelInfo, download = false) => {
     const suffix = download ? "?download=1" : "";
     return `${apiBase}/models/${model.scope}/${encodeURIComponent(model.name)}${suffix}`;
   }, [apiBase]);
+
+  const selectedScope = selected?.scope ?? "";
+  const selectedExtension = selected?.extension.toLowerCase() ?? "";
+  const selectedPreviewStatus = selected?.preview_status ?? "not_applicable";
+  const selectedPreviewUrl = selected?.preview_url ?? "";
+  const selectedPreviewRevision = selected?.preview_revision ?? "";
+  const selectedModified = selected?.modified ?? "";
+  const selectedViewable = selected?.viewable ?? false;
+  const selectedItemKey = selected ? `${selectedScope}\u0000${selected.name}` : "";
+  const selectedAssetUrl = useMemo(() => {
+    if (!selected || !apiBase || !selectedViewable) return "";
+    if (selectedExtension === "3mf") {
+      if (selectedPreviewStatus !== "ready" || !selectedPreviewUrl) return "";
+      const resolved = resolveApiUrl(selectedPreviewUrl, apiBase);
+      if (!resolved) return "";
+      const url = new URL(resolved);
+      if (selectedPreviewRevision && !url.searchParams.has("v")) {
+        url.searchParams.set("v", selectedPreviewRevision);
+      }
+      return url.toString();
+    }
+    return `${apiBase}/models/${selectedScope}/${encodeURIComponent(selected.name)}`;
+  }, [
+    apiBase,
+    selected,
+    selectedExtension,
+    selectedPreviewRevision,
+    selectedPreviewStatus,
+    selectedPreviewUrl,
+    selectedScope,
+    selectedViewable,
+  ]);
+  const loadKey = selectedAssetUrl
+    ? `${selectedItemKey}\u0000${selectedExtension}\u0000${selectedExtension === "3mf" ? selectedPreviewRevision : selectedModified}`
+    : "";
+
+  useEffect(() => {
+    if (
+      selectedExtension !== "3mf"
+      || !selectedItemKey
+      || (selectedPreviewStatus !== "pending" && selectedPreviewStatus !== "processing")
+    ) return;
+    const timer = window.setInterval(() => void refreshModels(), 2000);
+    return () => window.clearInterval(timer);
+  }, [refreshModels, selectedExtension, selectedItemKey, selectedPreviewStatus]);
 
   const runModelAction = useCallback(async (action: ModelAction) => {
     if (!selected || actionLoading) return;
@@ -145,6 +298,28 @@ export default function Home() {
     }
   }, [actionLoading, apiBase, refreshModels, selected]);
 
+  const retryPreview = useCallback(async () => {
+    if (!selected || selected.extension.toLowerCase() !== "3mf" || previewRetrying) return;
+    setPreviewRetrying(true);
+    setActionMessage("");
+    setModelError("");
+    try {
+      const response = await fetch(`${apiBase}/api/previews/retry`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scope: selected.scope, name: selected.name }),
+      });
+      const result = (await response.json().catch(() => ({}))) as { message?: string };
+      if (!response.ok) throw new Error(result.message || `HTTP ${response.status}`);
+      setActionMessage("已重新加入预览队列");
+      await refreshModels();
+    } catch (retryError) {
+      setModelError(retryError instanceof Error ? retryError.message : "无法重新生成预览");
+    } finally {
+      setPreviewRetrying(false);
+    }
+  }, [apiBase, previewRetrying, refreshModels, selected]);
+
   useEffect(() => {
     const host = canvasHost.current;
     if (!host) return;
@@ -157,7 +332,7 @@ export default function Home() {
     camera.position.set(120, -150, 105);
 
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -188,7 +363,7 @@ export default function Home() {
     });
     scene.add(grid);
 
-    const state: ViewerState = { scene, camera, renderer, controls, model: null, frame: 0, radius: 80 };
+    const state: ViewerState = { scene, camera, renderer, controls, model: null, modelKey: "", frame: 0, radius: 80 };
     viewer.current = state;
 
     const resize = () => {
@@ -213,8 +388,7 @@ export default function Home() {
       cancelAnimationFrame(state.frame);
       controls.dispose();
       if (state.model) {
-        state.model.geometry.dispose();
-        (state.model.material as THREE.Material).dispose();
+        disposeModel(state.model);
       }
       renderer.dispose();
       renderer.domElement.remove();
@@ -241,49 +415,144 @@ export default function Home() {
 
   useEffect(() => {
     const state = viewer.current;
-    if (!state || !selected?.viewable || !apiBase) return;
-    setModelLoading(true);
-    const loader = new STLLoader();
-    loader.load(
-      modelUrl(selected),
-      (geometry) => {
+    if (!state) return;
+
+    const generation = ++loadGeneration.current;
+    const controller = new AbortController();
+    const clearFrame = window.requestAnimationFrame(() => {
+      setModelLoading(false);
+      setLoadedModelKey("");
+      setModelError("");
+    });
+
+    if (state.model) {
+      state.scene.remove(state.model);
+      disposeModel(state.model);
+      state.model = null;
+      state.modelKey = "";
+    }
+
+    if (!selectedItemKey || !selectedViewable || !apiBase) {
+      return () => {
+        window.cancelAnimationFrame(clearFrame);
+        controller.abort();
+        if (loadGeneration.current === generation) loadGeneration.current += 1;
+      };
+    }
+
+    if (selectedExtension === "3mf" && selectedPreviewStatus !== "ready") {
+      return () => {
+        window.cancelAnimationFrame(clearFrame);
+        controller.abort();
+        if (loadGeneration.current === generation) loadGeneration.current += 1;
+      };
+    }
+
+    if (!selectedAssetUrl || !loadKey) {
+      const errorFrame = window.requestAnimationFrame(() => {
+        setModelError(selectedExtension === "3mf" ? "快速预览地址缺失，请重新生成预览。" : "模型地址无效。");
+      });
+      return () => {
+        window.cancelAnimationFrame(clearFrame);
+        window.cancelAnimationFrame(errorFrame);
+        controller.abort();
+        if (loadGeneration.current === generation) loadGeneration.current += 1;
+      };
+    }
+
+    const loadingFrame = window.requestAnimationFrame(() => {
+      setModelLoading(true);
+      setLoadedModelKey("");
+      setModelError("");
+    });
+
+    const isCurrent = () => loadGeneration.current === generation && !controller.signal.aborted;
+    const showModel = (model: THREE.Object3D) => {
+      if (!isCurrent()) {
+        disposeModel(model);
+        return;
+      }
+      model.updateMatrixWorld(true);
+      const box = new THREE.Box3().setFromObject(model);
+      if (!box.isEmpty()) {
+        const center = box.getCenter(new THREE.Vector3());
+        const size = box.getSize(new THREE.Vector3());
+        model.position.sub(center);
+        state.radius = Math.max(size.length() / 2, 10);
+      }
+      const enableShadows = selectedExtension !== "3mf";
+      model.traverse((child) => {
+        if (!(child instanceof THREE.Mesh)) return;
+        child.castShadow = enableShadows;
+        child.receiveShadow = enableShadows;
+      });
+      setModelWireframe(model, wireframeRef.current);
+      state.model = model;
+      state.modelKey = loadKey;
+      state.scene.add(model);
+      fitView("iso");
+      setLoadedModelKey(loadKey);
+      setModelLoading(false);
+    };
+
+    void (async () => {
+      try {
+        const response = await fetch(selectedAssetUrl, { signal: controller.signal });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const buffer = await response.arrayBuffer();
+        if (!isCurrent()) return;
+
+        if (selectedExtension === "3mf") {
+          const model = await new Promise<THREE.Object3D>((resolve, reject) => {
+            new GLTFLoader().parse(
+              buffer,
+              new URL(".", selectedAssetUrl).toString(),
+              (result) => resolve(result.scene),
+              reject,
+            );
+          });
+          showModel(model);
+          return;
+        }
+
+        const geometry = new STLLoader().parse(buffer);
         geometry.computeVertexNormals();
-        geometry.computeBoundingBox();
-        const box = geometry.boundingBox;
-        if (box) {
-          const center = new THREE.Vector3();
-          const size = new THREE.Vector3();
-          box.getCenter(center);
-          box.getSize(size);
-          geometry.translate(-center.x, -center.y, -center.z);
-          state.radius = Math.max(size.length() / 2, 10);
-        }
-        if (state.model) {
-          state.scene.remove(state.model);
-          state.model.geometry.dispose();
-          (state.model.material as THREE.Material).dispose();
-        }
-        const material = new THREE.MeshStandardMaterial({
+        showModel(new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({
           color: 0xb7c7dc,
           roughness: 0.44,
           metalness: 0.12,
-          wireframe,
-        });
-        const mesh = new THREE.Mesh(geometry, material);
-        mesh.castShadow = true;
-        mesh.receiveShadow = true;
-        state.model = mesh;
-        state.scene.add(mesh);
-        fitView("iso");
+        })));
+      } catch (loadError) {
+        if (!isCurrent()) return;
+        setModelError(loadError instanceof Error
+          ? `模型加载失败：${loadError.message}`
+          : "模型加载失败，预览格式可能不受支持。");
         setModelLoading(false);
-      },
-      undefined,
-      () => {
-        setError("模型加载失败，文件可能尚未导出完成。");
-        setModelLoading(false);
-      },
-    );
-  }, [apiBase, fitView, modelUrl, selected, wireframe]);
+      }
+    })();
+
+    return () => {
+      window.cancelAnimationFrame(clearFrame);
+      window.cancelAnimationFrame(loadingFrame);
+      controller.abort();
+      if (loadGeneration.current === generation) loadGeneration.current += 1;
+    };
+  }, [
+    apiBase,
+    fitView,
+    loadKey,
+    selectedAssetUrl,
+    selectedExtension,
+    selectedItemKey,
+    selectedPreviewStatus,
+    selectedViewable,
+  ]);
+
+  useEffect(() => {
+    wireframeRef.current = wireframe;
+    const model = viewer.current?.model;
+    if (model) setModelWireframe(model, wireframe);
+  }, [wireframe]);
 
   useEffect(() => {
     const state = viewer.current;
@@ -294,6 +563,36 @@ export default function Home() {
 
   const viewableModels = models.filter((model) => model.viewable);
   const supportingFiles = models.filter((model) => !model.viewable);
+  const hasMeshInspection = selected?.extension.toLowerCase() === "stl";
+  const isThreeMf = selectedExtension === "3mf";
+  const modelIsLoaded = Boolean(loadKey && loadedModelKey === loadKey);
+  const canRetryPreview = isThreeMf && (selectedPreviewStatus === "failed" || Boolean(modelError));
+  const previewProgressMessage = isThreeMf
+    ? {
+        not_applicable: "此文件不需要生成快速预览。",
+        pending: "快速预览已排队，生成完成后会自动加载。",
+        processing: "正在后台生成快速预览，生成完成后会自动加载。",
+        ready: modelLoading ? "正在加载已生成的快速预览…" : "",
+        failed: selected?.preview_error || "快速预览生成失败，请重新尝试。",
+      }[selectedPreviewStatus]
+    : "";
+  const viewerMessage = modelError || previewProgressMessage || (modelLoading ? "正在加载三维视图…" : "");
+  const previewTitle = modelError
+    ? "预览加载失败"
+    : selectedPreviewStatus === "failed"
+      ? "快速预览生成失败"
+      : selectedPreviewStatus === "pending"
+        ? "快速预览等待生成"
+        : selectedPreviewStatus === "processing"
+          ? "快速预览生成中"
+          : modelIsLoaded
+            ? "3MF 快速预览已加载"
+            : "3MF 快速预览已就绪";
+  const previewDescription = modelError
+    ? modelError
+    : selectedPreviewStatus === "ready"
+      ? "浏览器只加载服务端预生成的 GLB，原始 3MF 仍可下载。"
+      : selected?.preview_error || "服务端会在后台生成可快速审视的 GLB。";
 
   return (
     <main className="app-shell">
@@ -306,8 +605,8 @@ export default function Home() {
           </div>
         </div>
         <div className="connection-status">
-          <span className={error ? "status-dot error" : "status-dot"} />
-          <span>{error ? "服务异常" : "服务在线"}</span>
+          <span className={serviceError ? "status-dot error" : "status-dot"} />
+          <span>{serviceError ? "服务异常" : "服务在线"}</span>
           {updatedAt && <time>{updatedAt.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</time>}
           <button type="button" className="quiet-button" onClick={() => void refreshModels()} aria-label="刷新模型列表">
             刷新
@@ -322,7 +621,7 @@ export default function Home() {
               <span className="eyebrow">OUTPUT LIBRARY</span>
               <h1>模型版本</h1>
             </div>
-            <span className="count-pill">{viewableModels.length}</span>
+            <span className="count-pill">{counts[scope]}</span>
           </div>
           <div className="scope-tabs" role="tablist" aria-label="模型状态">
             {([
@@ -345,11 +644,17 @@ export default function Home() {
               </button>
             ))}
           </div>
+          <div className="preview-summary" aria-label="快速预览状态汇总">
+            <span className="ready">就绪 {previewCounts.ready}</span>
+            <span className="pending">等待 {previewCounts.pending}</span>
+            <span className="processing">生成中 {previewCounts.processing}</span>
+            <span className="failed">失败 {previewCounts.failed}</span>
+          </div>
           <div className="model-list">
             {loading && <p className="empty-message">正在读取模型目录…</p>}
             {!loading && viewableModels.length === 0 && (
               <p className="empty-message">
-                {scope === "active" ? "尚未发现可审视的 STL。" : scope === "archive" ? "归档区为空。" : "回收站为空。"}
+                {scope === "active" ? "尚未发现可审视的 STL 或 3MF。" : scope === "archive" ? "归档区为空。" : "回收站为空。"}
               </p>
             )}
             {viewableModels.map((model) => (
@@ -359,10 +664,17 @@ export default function Home() {
                 className={`model-row ${model.name === selectedName ? "active" : ""}`}
                 onClick={() => setSelectedName(model.name)}
               >
-                <span className="file-badge">STL</span>
+                <span className="file-badge">{model.extension.toUpperCase()}</span>
                 <span className="file-copy">
-                  <strong>{model.name.replace(/\.stl$/i, "")}</strong>
-                  <span>{formatDate(model.modified)} · {formatBytes(model.size)}</span>
+                  <strong>{model.name.replace(/\.[^.]+$/i, "")}</strong>
+                  <span>
+                    {formatDate(model.modified)} · {formatBytes(model.size)}
+                    {model.extension.toLowerCase() === "3mf" && (
+                      <em className={`preview-state ${model.preview_status}`}>
+                        {previewStatusLabel(model.preview_status)}
+                      </em>
+                    )}
+                  </span>
                 </span>
                 <span className="row-arrow">›</span>
               </button>
@@ -383,11 +695,16 @@ export default function Home() {
           <div ref={canvasHost} className="canvas-host" />
           <div className="viewer-overlay top-left">
             <span className="eyebrow">ACTIVE MODEL</span>
-            <strong>{selected?.name.replace(/\.stl$/i, "") || "等待模型"}</strong>
+            <strong>{selected?.name.replace(/\.[^.]+$/i, "") || "等待模型"}</strong>
           </div>
-          {(modelLoading || error) && (
-            <div className={`viewer-message ${error ? "has-error" : ""}`}>
-              {error || "正在构建三维视图…"}
+          {viewerMessage && (
+            <div className={`viewer-message ${modelError || selectedPreviewStatus === "failed" ? "has-error" : ""}`}>
+              <span>{viewerMessage}</span>
+              {canRetryPreview && (
+                <button type="button" disabled={previewRetrying} onClick={() => void retryPreview()}>
+                  {previewRetrying ? "正在提交…" : "重新生成预览"}
+                </button>
+              )}
             </div>
           )}
           <div className="view-toolbar" role="toolbar" aria-label="视角工具">
@@ -407,12 +724,12 @@ export default function Home() {
             <span className="eyebrow">GEOMETRY</span>
             <h2>模型检查</h2>
             <div className="quality-line">
-              <span className={`quality-icon ${selected?.watertight === false ? "bad" : ""}`}>
-                {selected?.watertight === false ? "!" : "✓"}
+              <span className={`quality-icon ${hasMeshInspection && selected?.watertight === false ? "bad" : ""}`}>
+                {!hasMeshInspection ? "3D" : selected?.watertight === false ? "!" : "✓"}
               </span>
               <div>
-                <strong>{selected?.watertight === false ? "检测到开放边" : "网格边闭合"}</strong>
-                <span>{selected?.watertight === false ? "建议修复后再切片" : "满足基础水密检查"}</span>
+                <strong>{isThreeMf ? previewTitle : selected?.watertight === false ? "检测到开放边" : "网格边闭合"}</strong>
+                <span>{isThreeMf ? previewDescription : selected?.watertight === false ? "建议修复后再切片" : "满足基础水密检查"}</span>
               </div>
             </div>
           </div>
@@ -440,7 +757,7 @@ export default function Home() {
           <div className="inspector-actions">
             {selected && (
               <a className="primary-action" href={modelUrl(selected, true)}>
-                下载当前 STL
+                下载当前 {selected.extension.toUpperCase()}
               </a>
             )}
             {selected && scope === "active" && (
